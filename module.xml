@@ -1,0 +1,60 @@
+<module>
+	<rawname>certmanacme</rawname>
+	<name>ACME Certificate Manager</name>
+	<repo>unsupported</repo>
+	<version>17.0.2</version>
+	<publisher>Lieblinger</publisher>
+	<license>GPLv3+</license>
+	<licenselink>http://www.gnu.org/licenses/gpl-3.0.txt</licenselink>
+	<menuitems>
+		<certmanacme category="Admin">ACME Certificates</certmanacme>
+	</menuitems>
+	<description>
+		ACME certificate management with DNS-01 challenge support.
+		Wraps acme.sh to provide 150+ DNS provider integrations for automated
+		SSL/TLS certificate issuance and renewal. Registers certificates with
+		the built-in Certificate Manager for seamless Asterisk/Apache/HAProxy integration.
+	</description>
+	<changelog>
+		*17.0.2.0* Fix settings save, add certificate edit view, fix service reloads after cert deploy, pre-signed module packaging
+		*17.0.1.0* Initial release with DNS-01 challenge support via acme.sh
+	</changelog>
+	<category>Admin</category>
+	<supported>
+		<version>17.0</version>
+	</supported>
+	<depends>
+		<phpversion>8.2.0</phpversion>
+		<module>certman ge 17.0.1</module>
+		<module>core ge 17.0.1</module>
+		<version>17.0.1</version>
+	</depends>
+	<database>
+		<table name="certman_acme_certs">
+			<field name="id" type="integer" primaryKey="true" autoincrement="true"/>
+			<field name="domain" type="string" length="255"/>
+			<field name="san" type="text" notnull="false"/>
+			<field name="dns_provider" type="string" length="64"/>
+			<field name="provider_env" type="text" notnull="false"/>
+			<field name="ca_server" type="string" length="255" default="letsencrypt"/>
+			<field name="certman_cid" type="integer" notnull="false"/>
+			<field name="status" type="string" length="20" default="pending"/>
+			<field name="issued_at" type="datetime" notnull="false"/>
+			<field name="expires_at" type="datetime" notnull="false"/>
+			<field name="last_error" type="text" notnull="false"/>
+			<key name="domain_UNIQUE" type="unique">
+				<column name="domain"/>
+			</key>
+		</table>
+		<table name="certman_acme_settings">
+			<field name="key" type="string" length="64" primaryKey="true"/>
+			<field name="value" type="text" notnull="false"/>
+		</table>
+	</database>
+	<console>
+		<command>
+			<name>certacme</name>
+			<class>CertmanAcme</class>
+		</command>
+	</console>
+</module>
