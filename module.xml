@@ -2,7 +2,7 @@
 	<rawname>certmanacme</rawname>
 	<name>ACME Certificate Manager</name>
 	<repo>unsupported</repo>
-	<version>17.0.2</version>
+	<version>17.0.3</version>
 	<publisher>Lieblinger</publisher>
 	<license>GPLv3+</license>
 	<licenselink>http://www.gnu.org/licenses/gpl-3.0.txt</licenselink>
@@ -16,6 +16,7 @@
 		the built-in Certificate Manager for seamless Asterisk/Apache/HAProxy integration.
 	</description>
 	<changelog>
+		*17.0.3.0* Direct HAProxy PEM deployment, background service reloads (fix ERR_EMPTY_RESPONSE)
 		*17.0.2.0* Fix settings save, add certificate edit view, fix service reloads after cert deploy, pre-signed module packaging
 		*17.0.1.0* Initial release with DNS-01 challenge support via acme.sh
 	</changelog>

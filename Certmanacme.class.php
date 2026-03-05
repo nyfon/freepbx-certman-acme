@@ -430,17 +430,15 @@ class Certmanacme implements \BMO
 
 		$result = $this->runAcme($args, $providerEnv);
 
-		// acme.sh returns 2 if cert is not due for renewal (skip)
-		if (!$result['success'] && $result['exit_code'] === 2) {
-			return ['success' => true, 'message' => sprintf("Certificate for '%s' is not due for renewal.", $domain)];
-		}
+		// acme.sh returns 2 if cert is not due for renewal (skip renewal but still redeploy)
+		$notDue = !$result['success'] && $result['exit_code'] === 2;
 
-		if (!$result['success']) {
+		if (!$result['success'] && !$notDue) {
 			$this->updateCertStatus($cert['id'], 'failed', $result['output']);
 			return ['success' => false, 'message' => "acme.sh renewal failed:\n" . $result['output']];
 		}
 
-		// Re-deploy
+		// Re-deploy (also triggers sysadmin hooks to sync to HAProxy/Apache)
 		$deployResult = $this->deployCertificate($domain);
 		if (!$deployResult['success']) {
 			$this->updateCertStatus($cert['id'], 'failed', $deployResult['message']);
@@ -450,10 +448,11 @@ class Certmanacme implements \BMO
 		$expiresAt = $this->readCertExpiry($domain);
 		$this->updateCertStatus($cert['id'], 'active', null, $expiresAt);
 
-		return [
-			'success' => true,
-			'message' => sprintf("Certificate for '%s' renewed and deployed successfully.", $domain),
-		];
+		$msg = $notDue
+			? sprintf("Certificate for '%s' is not due for renewal. Re-deployed existing cert.", $domain)
+			: sprintf("Certificate for '%s' renewed and deployed successfully.", $domain);
+
+		return ['success' => true, 'message' => $msg];
 	}
 
 	/**
@@ -625,7 +624,7 @@ class Certmanacme implements \BMO
 		// If this is the only certificate, make it the default automatically
 		$this->autoSetDefault($certmanCid);
 
-		// Trigger certman hooks (reload Apache, Asterisk, HAProxy)
+		// Trigger sysadmin cert install, Asterisk reload, and service restarts
 		$this->triggerReloads($certmanCid);
 
 		return ['success' => true, 'message' => sprintf("Certificate for '%s' deployed to FreePBX.", $domain)];
@@ -709,6 +708,47 @@ class Certmanacme implements \BMO
 	}
 
 	/**
+	 * Public entry point for the deferred background sysadmin install.
+	 *
+	 * Called from a detached PHP process spawned by triggerReloads().
+	 */
+	public function runDeferredSysadminInstall(int $certmanCid): void
+	{
+		$this->installInSysadmin($certmanCid);
+	}
+
+	/**
+	 * Install the certificate into sysadmin's HTTPS Setup.
+	 *
+	 * Calls Sysadmin::installHttpsCert() which copies the cert files to
+	 * /etc/apache2/pki/, regenerates the Apache SSL config, and restarts
+	 * Apache/HAProxy. Only runs for the default certificate.
+	 */
+	private function installInSysadmin(int $certmanCid): void
+	{
+		if (!$this->isDefault($certmanCid)) {
+			return;
+		}
+
+		try {
+			if (!$this->FreePBX->Modules->checkStatus('sysadmin')) {
+				return;
+			}
+
+			$certman = \FreePBX::Certman();
+			$details = $certman->getCertificateDetails($certmanCid);
+			if (empty($details['basename'])) {
+				return;
+			}
+
+			$sysadmin = $this->FreePBX->Sysadmin;
+			$sysadmin->installHttpsCert($details['basename'], true);
+		} catch (\Exception $e) {
+			// Non-fatal: sysadmin may not be available
+		}
+	}
+
+	/**
 	 * Check if a certificate is the current default.
 	 */
 	public function isDefault(int $certmanCid): bool
@@ -724,18 +764,13 @@ class Certmanacme implements \BMO
 	/**
 	 * Trigger FreePBX service reloads after certificate deployment.
 	 *
-	 * Mirrors what certman does: flag a reload, reload Asterisk directly,
-	 * run fwconsole reload (picks up Apache/all modules), and restart HAProxy.
+	 * Installs the cert into sysadmin's HTTPS Setup (syncs to /etc/apache2/pki/
+	 * for Apache and HAProxy), reloads Asterisk, and restarts services.
 	 */
 	private function triggerReloads(int $certmanCid): void
 	{
-		// Flag FreePBX that a reload is needed (shows "Apply Config" bar)
-		if (function_exists('needreload')) {
-			needreload();
-		}
-
 		try {
-			// Reload Asterisk TLS and dialplan
+			// Reload Asterisk TLS and dialplan (safe, doesn't restart Apache)
 			$astman = $this->FreePBX->astman;
 			if ($astman && $astman->connected()) {
 				$astman->Reload();
@@ -748,28 +783,22 @@ class Certmanacme implements \BMO
 			// Non-fatal
 		}
 
-		try {
-			// Full fwconsole reload (Apache, all modules)
-			$fwconsole = fpbx_which('fwconsole');
-			if (!empty($fwconsole)) {
-				exec($fwconsole . ' reload 2>&1');
-			}
-		} catch (\Exception $e) {
-			// Non-fatal
-		}
-
-		try {
-			// Reload HAProxy if sysadmin module is available and HAProxy is enabled
-			if ($this->FreePBX->Modules->checkStatus('sysadmin')) {
-				$sysadmin = $this->FreePBX->Sysadmin;
-				$haproxyEnabled = $sysadmin->getConfig('enbableHaproxy');
-				if ($haproxyEnabled === 'enabled') {
-					$sysadmin->runHook('update-sslconf', ['restart_haproxy' => true]);
-				}
-			}
-		} catch (\Exception $e) {
-			// Non-fatal
-		}
+		// Run sysadmin cert install + fwconsole reload in a detached background
+		// process with a small delay. installHttpsCert restarts Apache, which
+		// would kill this PHP process if run inline.
+		$fwconsole = fpbx_which('fwconsole');
+		$php = PHP_BINARY ?: '/usr/bin/php';
+		$script = sprintf(
+			'sleep 2; %s -r %s; %s',
+			escapeshellarg($php),
+			escapeshellarg(
+				'require_once "/etc/freepbx.conf";'
+				. '$certacme = \FreePBX::Certmanacme();'
+				. '$certacme->runDeferredSysadminInstall(' . (int) $certmanCid . ');'
+			),
+			!empty($fwconsole) ? (escapeshellarg($fwconsole) . ' reload') : 'true'
+		);
+		exec('(' . $script . ') >/dev/null 2>&1 &');
 	}
 
 	// ── acme.sh Shell Wrapper ────────────────────────────────────────

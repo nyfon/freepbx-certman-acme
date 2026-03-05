@@ -68,7 +68,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 		case 'renew':
 			$domain = strtolower(trim($_POST['domain'] ?? ''));
 			if ($domain) {
-				$result = $certacme->renewCertificate($domain, true);
+				$result = $certacme->renewCertificate($domain);
 				$type = $result['success'] ? 'success' : 'danger';
 				$_SESSION['certacme_msg'] = ['type' => $type, 'text' => $result['message']];
 			}
