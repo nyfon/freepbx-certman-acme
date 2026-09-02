@@ -1,5 +1,9 @@
 <?php
 // ACME Certificate Manager - Page Router
+if (!defined('FREEPBX_IS_AUTH')) {
+	die('No direct script access allowed');
+}
+
 $request = $_REQUEST;
 $certacme = FreePBX::Certmanacme();
 $request['action'] = !empty($request['action']) ? $request['action'] : '';

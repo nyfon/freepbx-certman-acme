@@ -410,7 +410,7 @@ class Certmanacme implements \BMO
 	/**
 	 * Renew a certificate.
 	 */
-	public function renewCertificate(string $domain, bool $force = false): array
+	public function renewCertificate(string $domain, bool $force = false, bool $deferReload = false): array
 	{
 		$cert = $this->getCertificateByDomain($domain);
 		if (!$cert) {
@@ -430,7 +430,7 @@ class Certmanacme implements \BMO
 
 		$result = $this->runAcme($args, $providerEnv);
 
-		// acme.sh returns 2 if cert is not due for renewal (skip renewal but still redeploy)
+		// acme.sh returns 2 if the cert is not due for renewal.
 		$notDue = !$result['success'] && $result['exit_code'] === 2;
 
 		if (!$result['success'] && !$notDue) {
@@ -438,8 +438,22 @@ class Certmanacme implements \BMO
 			return ['success' => false, 'message' => "acme.sh renewal failed:\n" . $result['output']];
 		}
 
+		// Nothing was renewed. Re-deploying unconditionally here is what keeps
+		// certman/sysadmin from drifting out of sync, but doing it every night
+		// rewrites all key material, restarts Apache and runs a full reload on a
+		// box where nothing changed. So only redeploy when the deployed copy has
+		// actually drifted from what acme.sh holds.
+		if ($notDue && $this->deployedCertMatches($domain)) {
+			$this->updateCertStatus($cert['id'], 'active', null, $this->readCertExpiry($domain));
+			return [
+				'success' => true,
+				'changed' => false,
+				'message' => sprintf("Certificate for '%s' is not due for renewal and is already in sync.", $domain),
+			];
+		}
+
 		// Re-deploy (also triggers sysadmin hooks to sync to HAProxy/Apache)
-		$deployResult = $this->deployCertificate($domain);
+		$deployResult = $this->deployCertificate($domain, $deferReload);
 		if (!$deployResult['success']) {
 			$this->updateCertStatus($cert['id'], 'failed', $deployResult['message']);
 			return $deployResult;
@@ -449,10 +463,41 @@ class Certmanacme implements \BMO
 		$this->updateCertStatus($cert['id'], 'active', null, $expiresAt);
 
 		$msg = $notDue
-			? sprintf("Certificate for '%s' is not due for renewal. Re-deployed existing cert.", $domain)
+			? sprintf("Certificate for '%s' is not due for renewal, but the deployed copy had drifted; re-deployed.", $domain)
 			: sprintf("Certificate for '%s' renewed and deployed successfully.", $domain);
 
-		return ['success' => true, 'message' => $msg];
+		return [
+			'success' => true,
+			'changed' => true,
+			'message' => $msg,
+			'certman_cid' => $deployResult['certman_cid'] ?? 0,
+		];
+	}
+
+	/**
+	 * Does the certificate deployed into certman still match what acme.sh holds?
+	 *
+	 * Used to decide whether a "not due for renewal" run needs to redeploy. A
+	 * mismatch means something drifted (a manual edit, a failed earlier deploy,
+	 * a cert renewed out-of-band) and is worth repairing; a match means there is
+	 * nothing to do and the reload storm can be skipped.
+	 */
+	private function deployedCertMatches(string $domain): bool
+	{
+		$certDir = $this->resolveAcmeCertDir($domain);
+		if ($certDir === null) {
+			return false;
+		}
+
+		$source = $certDir . '/' . $domain . '.cer';
+		$pkcs = \FreePBX::create()->PKCS;
+		$deployed = $pkcs->getKeysLocation() . '/' . $domain . '/cert.pem';
+
+		if (!file_exists($source) || !file_exists($deployed)) {
+			return false;
+		}
+
+		return hash_file('sha256', $source) === hash_file('sha256', $deployed);
 	}
 
 	/**
@@ -463,11 +508,29 @@ class Certmanacme implements \BMO
 		$certs = $this->getCertificates();
 		$results = [];
 
+		// Reloads are deferred out of the loop: each one spawns a detached
+		// `fwconsole reload`, so reloading per certificate would leave N of them
+		// regenerating /etc/asterisk concurrently.
+		$reloadCid = 0;
+
 		foreach ($certs as $cert) {
 			if ($cert['status'] === 'revoked') {
 				continue;
 			}
-			$results[$cert['domain']] = $this->renewCertificate($cert['domain'], $force);
+			$result = $this->renewCertificate($cert['domain'], $force, true);
+			$results[$cert['domain']] = $result;
+
+			if (!empty($result['changed']) && !empty($result['certman_cid'])) {
+				// Reload against the default certificate if one of them is it,
+				// otherwise against whichever actually changed.
+				if (!$reloadCid || $this->isDefault((int) $result['certman_cid'])) {
+					$reloadCid = (int) $result['certman_cid'];
+				}
+			}
+		}
+
+		if ($reloadCid) {
+			$this->triggerReloads($reloadCid);
 		}
 
 		return $results;
@@ -537,16 +600,34 @@ class Certmanacme implements \BMO
 	 * Copies cert files to /etc/asterisk/keys/{basename}/ and the integration
 	 * directory, then registers the cert in certman_certs.
 	 */
-	public function deployCertificate(string $domain): array
+	/**
+	 * Resolve the directory acme.sh stores a domain's certificate in.
+	 *
+	 * acme.sh uses <domain>_ecc/ or <domain>/ depending on the key type.
+	 *
+	 * @return string|null  The directory, or null if neither exists.
+	 */
+	private function resolveAcmeCertDir(string $domain): ?string
 	{
 		$acmeHome = $this->getAcmeHome();
-		$certDir = $acmeHome . '/' . $domain . '_ecc';
-
-		// acme.sh may use domain/ or domain_ecc/ depending on key type
-		if (!is_dir($certDir)) {
-			$certDir = $acmeHome . '/' . $domain;
+		foreach ([$acmeHome . '/' . $domain . '_ecc', $acmeHome . '/' . $domain] as $dir) {
+			if (is_dir($dir)) {
+				return $dir;
+			}
 		}
-		if (!is_dir($certDir)) {
+		return null;
+	}
+
+	/**
+	 * Deploy a certificate into the FreePBX/certman layout.
+	 *
+	 * @param bool $deferReload  Skip triggerReloads() so a caller looping over
+	 *                           several certificates can reload once at the end.
+	 */
+	public function deployCertificate(string $domain, bool $deferReload = false): array
+	{
+		$certDir = $this->resolveAcmeCertDir($domain);
+		if ($certDir === null) {
 			return ['success' => false, 'message' => sprintf("acme.sh cert directory not found for '%s'.", $domain)];
 		}
 
@@ -624,10 +705,19 @@ class Certmanacme implements \BMO
 		// If this is the only certificate, make it the default automatically
 		$this->autoSetDefault($certmanCid);
 
-		// Trigger sysadmin cert install, Asterisk reload, and service restarts
-		$this->triggerReloads($certmanCid);
+		// Trigger sysadmin cert install, Asterisk reload, and service restarts.
+		// Skipped when the caller is deploying several certificates in a loop --
+		// it reloads once at the end instead of spawning one detached reload per
+		// certificate, which would otherwise run concurrently.
+		if (!$deferReload) {
+			$this->triggerReloads($certmanCid);
+		}
 
-		return ['success' => true, 'message' => sprintf("Certificate for '%s' deployed to FreePBX.", $domain)];
+		return [
+			'success' => true,
+			'message' => sprintf("Certificate for '%s' deployed to FreePBX.", $domain),
+			'certman_cid' => $certmanCid,
+		];
 	}
 
 	/**
@@ -738,13 +828,40 @@ class Certmanacme implements \BMO
 			$certman = \FreePBX::Certman();
 			$details = $certman->getCertificateDetails($certmanCid);
 			if (empty($details['basename'])) {
+				$this->logDeferred("sysadmin install skipped: certman cid $certmanCid has no basename");
 				return;
 			}
 
 			$sysadmin = $this->FreePBX->Sysadmin;
+
+			// installHttpsCert() belongs to the commercial (ionCube-encoded)
+			// sysadmin module. checkStatus() only proves the module is enabled,
+			// not that this build exposes the method -- and a missing method
+			// raises \Error, which is not an \Exception.
+			if (!method_exists($sysadmin, 'installHttpsCert')) {
+				$this->logDeferred('sysadmin install skipped: this sysadmin build has no installHttpsCert()');
+				return;
+			}
+
 			$sysadmin->installHttpsCert($details['basename'], true);
-		} catch (\Exception $e) {
-			// Non-fatal: sysadmin may not be available
+			$this->logDeferred(sprintf("sysadmin HTTPS cert installed for '%s'", $details['basename']));
+		} catch (\Throwable $e) {
+			// Non-fatal, but must not be silent: the UI has already told the
+			// admin the certificate was deployed.
+			$this->logDeferred('sysadmin install failed: ' . $e->getMessage(), true);
+		}
+	}
+
+	/**
+	 * Log a line from the deferred/background deployment path.
+	 *
+	 * That path runs detached with no UI attached, so without this a failed
+	 * sysadmin install is invisible while the web UI shows a success banner.
+	 */
+	private function logDeferred(string $message, bool $isError = false): void
+	{
+		if (function_exists('freepbx_log')) {
+			freepbx_log($isError ? FPBX_LOG_ERROR : FPBX_LOG_INFO, 'certmanacme: ' . $message);
 		}
 	}
 
@@ -787,7 +904,9 @@ class Certmanacme implements \BMO
 		// process with a small delay. installHttpsCert restarts Apache, which
 		// would kill this PHP process if run inline.
 		$fwconsole = fpbx_which('fwconsole');
-		$php = PHP_BINARY ?: '/usr/bin/php';
+		$php = $this->getPhpCli();
+		$log = '/var/log/asterisk/certmanacme-deploy.log';
+
 		$script = sprintf(
 			'sleep 2; %s -r %s; %s',
 			escapeshellarg($php),
@@ -798,7 +917,46 @@ class Certmanacme implements \BMO
 			),
 			!empty($fwconsole) ? (escapeshellarg($fwconsole) . ' reload') : 'true'
 		);
-		exec('(' . $script . ') >/dev/null 2>&1 &');
+
+		// setsid is what makes this survive: a plain `&` child is reparented to
+		// PID 1 but stays inside apache2.service's cgroup, so the Apache restart
+		// that installHttpsCert triggers kills it mid-flight and the trailing
+		// reload silently never happens.
+		$setsid = fpbx_which('setsid');
+		$spawn = '(' . $script . ') >> ' . escapeshellarg($log) . ' 2>&1 &';
+		if (!empty($setsid)) {
+			$spawn = escapeshellarg($setsid) . ' sh -c ' . escapeshellarg($script)
+				. ' >> ' . escapeshellarg($log) . ' 2>&1 &';
+		}
+
+		$exitCode = -1;
+		$output = [];
+		exec($spawn, $output, $exitCode);
+		if ($exitCode !== 0) {
+			$this->logDeferred('failed to spawn deferred deployment process', true);
+		}
+
+		// The deferred reload is fire-and-forget and unverified, so leave the
+		// "Apply Config" bar up: if the background process dies, that bar is the
+		// only signal the admin gets.
+		if (function_exists('needreload')) {
+			needreload();
+		}
+	}
+
+	/**
+	 * Resolve a PHP CLI binary usable with -r.
+	 *
+	 * PHP_BINARY is empty under mod_php and points at the FPM master (which does
+	 * not accept -r) under PHP-FPM, so it is only trustworthy from the CLI SAPI.
+	 */
+	private function getPhpCli(): string
+	{
+		if (php_sapi_name() === 'cli' && !empty(PHP_BINARY)) {
+			return PHP_BINARY;
+		}
+		$php = fpbx_which('php');
+		return !empty($php) ? $php : '/usr/bin/php';
 	}
 
 	// ── acme.sh Shell Wrapper ────────────────────────────────────────

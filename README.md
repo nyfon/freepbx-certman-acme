@@ -72,6 +72,32 @@ Navigate to **Admin → ACME Certificates** in the FreePBX web interface.
 3. Certificates are registered in certman's database (type `up`) for native integration
 4. Asterisk, Apache, and HAProxy are automatically reloaded after deployment
 
+## Module signing
+
+This module ships unsigned. FreePBX treats an unsigned module as a banner in Module Admin and
+nothing more -- only a *revoked* signature actually blocks a module from loading.
+
+If you want tamper-detection on a particular box, local-sign it there:
+
+```bash
+/usr/src/devtools/sign.php /var/www/html/admin/modules/certmanacme --local <keyid>
+```
+
+The hash list lands in `/etc/freepbx.secure/certmanacme.sig` and is valid for that machine only.
+The signing key must be present in the asterisk user's GPG keyring (`/home/asterisk/.gnupg`) but
+must **not** be given ultimate ownertrust, or verification silently takes a path that reports the
+module as tampered.
+
+### Upgrading from 17.0.2
+
+17.0.2 and 17.0.3 shipped a pre-signed `module.sig` and installed a signature into
+`/etc/freepbx.secure/certmanacme.sig`. That scheme is gone. The leftover file is inert -- with no
+`module.sig` present FreePBX never reads it -- but you can remove it:
+
+```bash
+rm -f /etc/freepbx.secure/certmanacme.sig
+```
+
 ## License
 
 GPLv3+

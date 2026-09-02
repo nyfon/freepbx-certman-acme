@@ -15,9 +15,3 @@ foreach (FreePBX::Cron()->getAll() as $cron) {
 
 // Remove notifications
 FreePBX::Notifications()->delete('certmanacme', 'ACME_DOWNLOAD_FAILED');
-
-// Remove local secure signature
-$sigFile = '/etc/freepbx.secure/certmanacme.sig';
-if (file_exists($sigFile)) {
-	@unlink($sigFile);
-}
