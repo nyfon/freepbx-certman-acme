@@ -15,3 +15,11 @@ foreach (FreePBX::Cron()->getAll() as $cron) {
 
 // Remove notifications
 FreePBX::Notifications()->delete('certmanacme', 'ACME_DOWNLOAD_FAILED');
+
+// Remove any local signature left behind, including the one the 17.0.2/17.0.3
+// pre-signed packaging installed. Harmless if absent.
+foreach ([__DIR__ . '/module.sig', '/etc/freepbx.secure/certmanacme.sig'] as $sigFile) {
+	if (file_exists($sigFile)) {
+		@unlink($sigFile);
+	}
+}

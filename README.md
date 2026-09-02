@@ -88,15 +88,25 @@ The signing key must be present in the asterisk user's GPG keyring (`/home/aster
 must **not** be given ultimate ownertrust, or verification silently takes a path that reports the
 module as tampered.
 
-### Upgrading from 17.0.2
+### Upgrading from 17.0.2 / 17.0.3
 
-17.0.2 and 17.0.3 shipped a pre-signed `module.sig` and installed a signature into
-`/etc/freepbx.secure/certmanacme.sig`. That scheme is gone. The leftover file is inert -- with no
-`module.sig` present FreePBX never reads it -- but you can remove it:
+Those releases shipped a pre-signed `module.sig` and installed a hash list into
+`/etc/freepbx.secure/certmanacme.sig`. That scheme is gone.
+
+An in-place upgrade leaves the old `module.sig` behind, and it still covers the *old* files -- so
+FreePBX re-hashes the new ones, finds a mismatch, and reports **"Module has been tampered. Please
+redownload"**. Since 17.0.5 the installer removes both leftovers automatically, and the module then
+reads as unsigned, which is the expected state.
+
+If you are on 17.0.4 and seeing that banner, clear it by hand:
 
 ```bash
+rm -f /var/www/html/admin/modules/certmanacme/module.sig
 rm -f /etc/freepbx.secure/certmanacme.sig
+fwconsole reload
 ```
+
+Upgrading straight to 17.0.5 does this for you.
 
 ## License
 

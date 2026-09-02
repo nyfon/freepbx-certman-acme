@@ -2,7 +2,7 @@
 	<rawname>certmanacme</rawname>
 	<name>ACME Certificate Manager</name>
 	<repo>unsupported</repo>
-	<version>17.0.4</version>
+	<version>17.0.5</version>
 	<publisher>Lieblinger</publisher>
 	<license>GPLv3+</license>
 	<licenselink>http://www.gnu.org/licenses/gpl-3.0.txt</licenselink>
@@ -16,6 +16,7 @@
 		the built-in Certificate Manager for seamless Asterisk/Apache/HAProxy integration.
 	</description>
 	<changelog>
+		*17.0.5.0* Fix "Module has been tampered" after upgrading from 17.0.2/17.0.3 by removing the stale pre-signed module.sig on install
 		*17.0.4.0* Only redeploy when the deployed cert has drifted (no more nightly reload), single reload per renew run, deferred deploy survives the Apache restart and is logged, add missing auth guard, drop pre-signed module packaging
 		*17.0.3.0* Sync HTTPS cert through sysadmin's HTTPS Setup, background service reloads (fix ERR_EMPTY_RESPONSE)
 		*17.0.2.0* Fix settings save, add certificate edit view, fix service reloads after cert deploy, pre-signed module packaging

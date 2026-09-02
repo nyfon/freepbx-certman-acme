@@ -59,6 +59,57 @@ try {
 		"minute" => rand(0, 59),
 	));
 
+	// --- Migration off the 17.0.2/17.0.3 pre-signed packaging -----------------
+	//
+	// Those releases shipped a module.sig (a type=local *pointer*) and installed a
+	// hash list into /etc/freepbx.secure. An in-place upgrade leaves module.sig
+	// behind, and it still covers the OLD files -- so FreePBX re-hashes the new
+	// ones, they do not match, and Module Admin reports
+	// "Module has been tampered. Please redownload".
+	//
+	// Any pre-existing signature is stale by definition at this point: install.php
+	// only runs on install/upgrade, which is exactly when the files change. Remove
+	// the pair so the module reads cleanly as unsigned. Admins who want a signature
+	// local-sign the box after installing (see README).
+	$staleSigs = [
+		__DIR__ . '/module.sig',
+		'/etc/freepbx.secure/certmanacme.sig',
+	];
+	foreach ($staleSigs as $staleSig) {
+		if (file_exists($staleSig)) {
+			@unlink($staleSig);
+		}
+	}
+
+	// 17.0.2/17.0.3 also gave the bundled signing key *ultimate* ownertrust, which
+	// is what broke verification in the first place: a trusted key sends
+	// GPG::checkSig() down a branch that omits 'parsedout', so verifyModule() never
+	// recognises a type=local signature. Undo our own side effect so a later local
+	// signing on this box works. Non-fatal -- the key may already be gone.
+	$oldKeyFpr = '2DF52C9E1CA424385850B1FE5D2C91139077FDD0';
+	$webuser = FreePBX::Config()->get('AMPASTERISKWEBUSER');
+	if ($webuser && ($web = posix_getpwnam($webuser))) {
+		$gpgHome = rtrim($web['dir'], '/') . '/.gnupg';
+		$listed = [];
+		exec(sprintf(
+			'gpg --homedir %s --batch --list-keys %s 2>/dev/null',
+			escapeshellarg($gpgHome),
+			escapeshellarg($oldKeyFpr)
+		), $listed, $keyPresent);
+
+		if ($keyPresent === 0) {
+			$trustFile = tempnam(sys_get_temp_dir(), 'gpg-trust-');
+			file_put_contents($trustFile, $oldKeyFpr . ":2:\n");
+			exec(sprintf(
+				'sudo -u %s gpg --homedir %s --batch --import-ownertrust %s 2>&1',
+				escapeshellarg($webuser),
+				escapeshellarg($gpgHome),
+				escapeshellarg($trustFile)
+			));
+			@unlink($trustFile);
+		}
+	}
+
 	// Store default settings
 	$pdo = FreePBX::Database();
 	$defaults = [
